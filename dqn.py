@@ -3,19 +3,31 @@ import collections
 import random
 
 import torch
+from torch import argmax
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn.utils.prune as prune
 
+from typing import List
+from torch.optim import optimizer
+
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
+
+
+# import numpy as np
+
 import matplotlib.pyplot as plt
 
 # Hyperparameters
-learning_rate = 1e-4
-gamma = 0.99999
-buffer_limit = 5000
-batch_size = 128
+learning_rate = 1e-2
+gamma = 0.999
+buffer_limit = 10000
+batch_size = 64
 random_steps = 0
+num_nets = 5
 
 
 class GaussianNoise(nn.Module):
@@ -32,7 +44,7 @@ class GaussianNoise(nn.Module):
             network to generate vectors with smaller values.
     """
 
-    def __init__(self, sigma=0.1, is_relative_detach=True):
+    def __init__(self, sigma=0.1, is_relative_detach=False):
         super().__init__()
         self.sigma = sigma
         self.is_relative_detach = is_relative_detach
@@ -69,9 +81,16 @@ def plot_grad_flow(named_parameters):
 class ReplayBuffer:
     def __init__(self):
         self.buffer = collections.deque(maxlen=buffer_limit)
+        self.max_reward = 1.0
 
     def put(self, transition):
         self.buffer.append(transition)
+
+    def set_max_reward(self, r):
+        if self.max_reward is None:
+            self.max_reward = r
+        else:
+            self.max_reward = max(self.max_reward, r)
 
     def sample(self, n):
         mini_batch = random.choices(self.buffer, k=n)
@@ -109,57 +128,47 @@ def nl(x):
 
 
 class Qnet(nn.Module):
-    def __init__(self):
+    def __init__(self, env: gym.Env, memory: ReplayBuffer):
         super(Qnet, self).__init__()
-        h = 64
-        self.noise = GaussianNoise(sigma=0.05)
-        # self.fc1 = nn.Linear(4, 128)
-        self.fc1 = nn.Linear(4, h)
-        # self.fc1 = nn.Linear(8, h)
+        self.memory = memory
+        h = 32
+        self.noise = GaussianNoise(sigma=0.01, is_relative_detach=False)
+        # self.fc1 = nn.Linear(4, h)
+        self.inp = env.observation_space.shape[0]
+        self.outp = env.action_space.n
+
+        self.fc1 = nn.Linear(self.inp, h)
         self.fc2 = nn.Linear(h, h)
-        self.fc3 = nn.Linear(h, h)
-        self.fc4 = nn.Linear(h, h)
-        # self.fc4 = nn.Linear(h, 4)
-        self.fc5 = nn.Linear(h, 2)
+        self.fc3 = nn.Linear(h, self.outp)
 
     def forward(self, x):
-        x = self.fc1(x)
-        # l1 = F.dropout(x, p=0.15)
-        l1 = x
-        # x = nl(self.fc2(x))
-        x1 = torch.softmax(self.fc2(l1), dim=-1)
-        x1 = self.noise(x1)
-        # x1 = F.dropout(x1, p=0.15)
 
-        x2 = torch.softmax(self.fc3(l1), dim=-1)
-        x2 = self.noise(x2)
-        # x2 = F.dropout(x2, p=0.15)
-
-        x3 = torch.softmax(self.fc4(l1), dim=-1)
-        x3 = self.noise(x3)
-        # x3 = F.dropout(x3, p=0.15)
-
-        x = self.fc5(x1 + x2 + x3)
+        x = torch.relu(self.fc1(x))
+        # x = torch.tanh(self.fc2(x))
+        x = self.fc3(x)
         return x
 
     def sample_action(self, obs, epsilon, mem_size):
         coin = random.random()
         if coin < epsilon or mem_size < random_steps:
-            # return random.randint(0, 3)
-            return random.randint(0, 1)
+            return random.randint(0, self.outp - 1)
+            # return random.randint(0, 1)
         else:
-            out = self.forward(obs)
+            out = self.forward(obs.unsqueeze(0))
             return out.argmax().item()
 
 
-def train(q, q_target, memory, optimizer):
-
+def train(q, q_target, memory, optimizer, ep):
     losses = []
     if memory.size() < random_steps:
         return
 
-    for i in range(800):
-        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+    # bz = batch_size if memory.max_reward < 400 else batch_size * 8
+    # bz = int(memory.max_reward) * 2
+    bz = batch_size
+
+    for i in range(400):
+        s, a, r, s_prime, done_mask = memory.sample(bz)
 
         # n = torch.distributions.Uniform(0.99, 1.010).sample()
 
@@ -169,31 +178,88 @@ def train(q, q_target, memory, optimizer):
         # s_prime = s_prime + n
 
         q_out = q(s)
-        q_a = q_out.gather(1, a)
+        q_a = q_out.gather(1, a)  # / memory.max_reward
         # max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
         with torch.no_grad():
 
-            max_q_prime = q(s_prime).max(1)[0].unsqueeze(1)
+            # max_q_prime1 = q_target(s_prime).max(1)[0]
+            # max_q_prime2 = q(s_prime).max(1)[0]
+            # max_q = torch.stack((max_q_prime1, max_q_prime2), dim=1)
+            # max_q_prime = max_q.min(1)[0].unsqueeze(1)
+
+            max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
+
+            # max_q_prime1 = q_target(s_prime).max(1)[0].unsqueeze(1)
+            # max_q_prime = q_target(s_prime).mean(1).unsqueeze(1)
             target = r + gamma * max_q_prime * done_mask
 
+            target[target > 500.0] = torch.tensor(500.0)
+            # target = torch.log(target + 1)
+            # target = target / memory.max_reward
+
         # loss = F.smooth_l1_loss(q_a, target)
-        loss = F.mse_loss(q_a, target)
+        # l = F.mse_loss(q_a, target, reduce=None)
+        l = (q_a - target) ** 2
+        # m = l.max()
+        # l[l < 0.01] = 0
+        loss = l.mean()
+        # loss = torch.sigmoid(q_a - target).mean()
 
         optimizer.zero_grad()
         loss.backward()
+
+        # q.fc1.weights
+
         # plot_grad_flow(q.named_parameters())
+        # clip = 1.0 / (memory.max_reward ** 2)
+        # for p in q.parameters():
+        #     clip = torch.log(p.grad.abs().max() + 1)
+        #     p.grad.data.clamp_(-clip, clip)
+
+        # for p in q.parameters():
+        #     if p.grad is None or len(p.grad.shape) == 1:
+        #         continue
+
+        #     if torch.randint(low=0, high=10, size=()) >= 5:
+        #         r = torch.zeros_like(p.grad)
+        #         p.grad *= r
+
+        #     # idx = torch.argmax(p.grad, dim=1)
+        #     # idx = torch.randint(0, p.grad.shape[1], (p.grad.shape[0], 1))
+
+        #     # # p.grad.where(p.grad <= value, p.grad * 0.0001, p.grad)
+        #     # r = torch.zeros_like(p.grad)
+        #     # if torch.randint(low=0, high=10, size=()) >= 5:
+        #     #     r[:, idx] = 1.0
+
+        #     # p.grad *= r
+
+        #     # for i, qq in enumerate(p.grad):
+        #     #     if i == idx:
+        #     #         qq *= 0.0001
+
+        #     # half = len(p.grad) // 2
+        #     # if ep % 10 > 5:
+        #     #     p.grad[:half] *= 0.001  # or whatever other operation
+        #     # else:
+        #     #     p.grad[half:] *= 0.001  # or whatever other operation
+
         optimizer.step()
+        # q.fc1.weight.data = torch.clamp(q.fc1.weight.data, -1.0, 1.0)
+        # q.fc2.weight.data = torch.clamp(q.fc2.weight.data, -1.0, 1.0)
         losses.append(loss.item())
 
-    print(f"{torch.mean(torch.tensor(losses))}")
+    writer.add_scalar("Loss/train", torch.mean(torch.tensor(losses)), ep)
+
+    print(f"bz: {bz} loss: {torch.mean(torch.tensor(losses))}")
 
 
 def main():
-    import math
-
     env = gym.make("CartPole-v1")
     # env = gym.make("LunarLander-v2")
-    q = Qnet()
+
+    memories = [ReplayBuffer() for _ in range(num_nets)]
+    qs = [Qnet(env, memories[i]) for i in range(num_nets)]
 
     def weights_init_uniform(m):
         classname = m.__class__.__name__
@@ -201,26 +267,37 @@ def main():
         if classname.find("Linear") != -1:
             # apply a uniform distribution to the weights and a bias=0
             # i = math.pi
-            # i = 0.01
-            # m.weight.data.uniform_(-i, i)
-            # m.bias.data.uniform_(-i, i)
+            i = 2.0
+            m.weight.data.uniform_(-i, i)
+            m.bias.data.uniform_(-i, i)
 
-            m.weight.data.fill_(1.0)
-            m.bias.data.fill_(0.0)
+            # m.weight.data.fill_(1.0)
+            # m.bias.data.fill_(0.0)
 
-    q.apply(weights_init_uniform)
+    # q.apply(weights_init_uniform)
+    # q_target.apply(weights_init_uniform)
+    # q_target.load_state_dict(q.state_dict())
+
+    for i, q in enumerate(qs):
+        if i == 0:
+            continue
+
+        q.load_state_dict(qs[0].state_dict())
+
     # clip_value = 0.3
     # for p in q.parameters():
     #     p.register_hook(lambda grad: torch.clamp(grad, -clip_value, clip_value))
 
     # q_target = Qnet()
     # q_target.load_state_dict(q.state_dict())
-    memory = ReplayBuffer()
 
     print_interval = 1
     score = 0.0
-    optimizer = optim.Adam(q.parameters(), lr=learning_rate)
-    # optimizer = optim.SGD(q.parameters(), lr=learning_rate, momentum=0.95)
+
+    optimizers = [
+        optim.Adam(qs[i].parameters(), lr=learning_rate) for i in range(num_nets)
+    ]
+    step = 0
 
     for n_epi in range(10000):
 
@@ -232,21 +309,43 @@ def main():
         #     0.01, 0.06 - 0.01 * (n_epi / 50)
         # )  # Linear annealing from 8% to 1%
 
-        epsilon = 0.0
+        epsilon = 0.05
         s = env.reset()
         done = False
 
         while not done:
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon, memory.size())
+            # a = q.sample_action(, epsilon, memory.size())
+
+            obs = torch.from_numpy(s).float().unsqueeze(0)
+
+            outs = [q(obs).argmax().item() for q in qs]
+            a = max(set(outs), key=outs.count)
+
+            # outs = torch.stack([q(obs) for q in qs])
+            # outs = torch.sum(outs, 0)
+
+            # a = outs.argmax().item()
+
             s_prime, r, done, info = env.step(a)
             env.render()
             done_mask = 0.0 if done else 1.0
-            memory.put((s, a, r / 400.0, s_prime, done_mask))
+
+            data = (s, a, r / 500, s_prime, done_mask)
+            # if done:
+            #     data = (s, a, score / 500, s_prime, done_mask)
+            # else:
+            #     data = (s, a, 0.0, s_prime, done_mask)
+
+            memories[step % len(memories)].put(data)
+
             s = s_prime
 
             score += r
+            step += 1
             if done:
-                train(q, None, memory, optimizer)
+                [m.set_max_reward(score) for m in memories]
+                writer.add_scalar("reward", score, n_epi)
+                break
 
                 # params = (
                 #     (q.fc1, "weight"),
@@ -258,16 +357,30 @@ def main():
                 #     params, pruning_method=prune.L1Unstructured, amount=0.5
                 # )
 
-                break
-
-        if n_epi % print_interval == 0 and n_epi != 0:
+        if n_epi % print_interval == 0:
             # q_target.load_state_dict(q.state_dict())
             print(
                 "n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%".format(
-                    n_epi, score / print_interval, memory.size(), epsilon * 100
+                    n_epi, score / print_interval, memories[0].size(), epsilon * 100
                 )
             )
             score = 0.0
+
+        for i in range(num_nets):
+            q = qs[i]
+
+            r = int(torch.randint(0, len(memories), ()).item())
+            r2 = int(torch.randint(0, len(memories), ()).item())
+
+            q_target = qs[r]
+            memory = memories[r2]
+
+            # q_target = qs[(i + 1) % len(qs)]
+            # memory = memories[i]
+            optimizer = optimizers[i]
+
+            train(q, q_target, memory, optimizer, n_epi)
+
     env.close()
 
 
