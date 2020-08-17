@@ -7,12 +7,13 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torch.optim as optim
 import torch.nn.utils.prune as prune
+from torch.distributions.beta import Beta
 
 import matplotlib.pyplot as plt
 
 # Hyperparameters
-learning_rate = 1e-4
-gamma = 0.99999
+learning_rate = 1e-2
+gamma = 0.9
 buffer_limit = 5000
 batch_size = 128
 random_steps = 0
@@ -97,50 +98,92 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def nl(x):
-    # return torch.log(torch.abs(x) + 0.1)
-    # return torch.nn.functional.leaky_relu(x)
-    # return torch.sigmoid(x)
-    # return torch.tanh(x)
-    return torch.relu(x)
-    # return torch.sin(x)
-    # return torch.relu(torch.fmod(x, 2))
-    # return torch.tanh(torch.fmod(x, 2))
+class Gumbel(nn.Module):
+    """ 
+    Returns differentiable discrete outputs. Applies a Gumbel-Softmax trick on every element of x. 
+    """
+
+    def __init__(self, eps=1e-8):
+        super(Gumbel, self).__init__()
+        self.eps = eps
+
+    def forward(self, x, gumbel_temp=1.0, gumbel_noise=True):
+        if not self.training:  # no Gumbel noise during inference
+            return (x >= 0).float()
+
+        if gumbel_noise:
+            eps = self.eps
+            U1, U2 = torch.rand_like(x), torch.rand_like(x)
+            g1, g2 = (
+                -torch.log(-torch.log(U1 + eps) + eps),
+                -torch.log(-torch.log(U2 + eps) + eps),
+            )
+            x = x + g1 - g2
+
+        soft = torch.sigmoid(x / gumbel_temp)
+        hard = ((soft >= 0.5).float() - soft).detach() + soft
+        assert not torch.any(torch.isnan(hard))
+        return hard, soft
 
 
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        h = 64
+        h = 4
         self.noise = GaussianNoise(sigma=0.05)
-        # self.fc1 = nn.Linear(4, 128)
         self.fc1 = nn.Linear(4, h)
-        # self.fc1 = nn.Linear(8, h)
-        self.fc2 = nn.Linear(h, h)
-        self.fc3 = nn.Linear(h, h)
-        self.fc4 = nn.Linear(h, h)
-        # self.fc4 = nn.Linear(h, 4)
-        self.fc5 = nn.Linear(h, 2)
+        self.gumbel = Gumbel()
+
+        self.count = 2
+
+        self.picker = nn.Linear(h, self.count)
+
+        self.l = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
+                for _ in range(self.count)
+            ]
+        )
+
+        # self.l1 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
+        # self.l2 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
+        # self.l3 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
+        # self.l4 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
+
+        self.lout = nn.Linear(h * 4, 2)
 
     def forward(self, x):
-        x = self.fc1(x)
-        # l1 = F.dropout(x, p=0.15)
-        l1 = x
-        # x = nl(self.fc2(x))
-        x1 = torch.softmax(self.fc2(l1), dim=-1)
-        x1 = self.noise(x1)
-        # x1 = F.dropout(x1, p=0.15)
+        x = torch.tanh(self.fc1(x))
 
-        x2 = torch.softmax(self.fc3(l1), dim=-1)
-        x2 = self.noise(x2)
-        # x2 = F.dropout(x2, p=0.15)
+        p, p_soft = self.gumbel(self.picker(x))
 
-        x3 = torch.softmax(self.fc4(l1), dim=-1)
-        x3 = self.noise(x3)
-        # x3 = F.dropout(x3, p=0.15)
+        ls = [l(x) for l in self.l]
 
-        x = self.fc5(x1 + x2 + x3)
-        return x
+        lg = [ls[i] * p[:, i].unsqueeze(1) for i in range(self.count)]
+
+        out = torch.stack(lg, 0).sum(0)
+
+        # l1 = self.l1(x)
+        # l2 = self.l2(x)
+        # l3 = self.l3(x)
+        # l4 = self.l4(x)
+
+        # p1 = l1 * p[:, 0].unsqueeze(1)
+        # p2 = l2 * p[:, 1].unsqueeze(1)
+        # p3 = l3 * p[:, 2].unsqueeze(1)
+        # p4 = l4 * p[:, 3].unsqueeze(1)
+
+        # q = torch.cat([p1, p2, p3, p4], 1)
+        # out = self.lout(q)
+
+        # out = p1 + p2 + p3 + p4
+
+        return {"out": out, "p": p, "p_soft": p_soft}
+        # return l1
+
+        # w = self.fg(x)
+
+        # return tot * (w) + tot_gated * (1.0 - w)
 
     def sample_action(self, obs, epsilon, mem_size):
         coin = random.random()
@@ -148,17 +191,21 @@ class Qnet(nn.Module):
             # return random.randint(0, 3)
             return random.randint(0, 1)
         else:
-            out = self.forward(obs)
-            return out.argmax().item()
+            out = self.forward(obs.unsqueeze(0))
+            return out["out"].argmax().item()
 
 
-def train(q, q_target, memory, optimizer):
+# beta = Beta(torch.tensor([0.6]), torch.tensor([0.4]))
+# beta.cdf()
+
+
+def train(q, q_target, memory, optimizer, epoch):
 
     losses = []
     if memory.size() < random_steps:
         return
 
-    for i in range(800):
+    for i in range(400):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
         # n = torch.distributions.Uniform(0.99, 1.010).sample()
@@ -169,15 +216,26 @@ def train(q, q_target, memory, optimizer):
         # s_prime = s_prime + n
 
         q_out = q(s)
-        q_a = q_out.gather(1, a)
+        d = q_out["p_soft"]
+        # d = q_out["p"]
+        q_a = q_out["out"].gather(1, a)
         # max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
         with torch.no_grad():
+            qp = q(s_prime)
 
-            max_q_prime = q(s_prime).max(1)[0].unsqueeze(1)
+            max_q_prime = qp["out"].max(1)[0].unsqueeze(1)
             target = r + gamma * max_q_prime * done_mask
 
-        # loss = F.smooth_l1_loss(q_a, target)
-        loss = F.mse_loss(q_a, target)
+            # target[target > 1.0] = 1.0
+        # gateLoss = F.smooth_l1_loss(d, torch.ones_like(d) / 3)
+        # gateLoss = torch.exp(-gateLoss/5)
+        # q_out["p"].sum(0) / batch_size
+
+        loss = F.smooth_l1_loss(
+            q_a, target
+        )  # + gateLoss / ( epoch + 1)  # / (torch.exp(-gateLoss))
+        # loss = F.mse_loss(q_a, target)
+        # if d[0] < 0.
 
         optimizer.zero_grad()
         loss.backward()
@@ -208,7 +266,7 @@ def main():
             m.weight.data.fill_(1.0)
             m.bias.data.fill_(0.0)
 
-    q.apply(weights_init_uniform)
+    # q.apply(weights_init_uniform)
     # clip_value = 0.3
     # for p in q.parameters():
     #     p.register_hook(lambda grad: torch.clamp(grad, -clip_value, clip_value))
@@ -232,7 +290,7 @@ def main():
         #     0.01, 0.06 - 0.01 * (n_epi / 50)
         # )  # Linear annealing from 8% to 1%
 
-        epsilon = 0.0
+        epsilon = 0.05
         s = env.reset()
         done = False
 
@@ -241,12 +299,12 @@ def main():
             s_prime, r, done, info = env.step(a)
             env.render()
             done_mask = 0.0 if done else 1.0
-            memory.put((s, a, r / 400.0, s_prime, done_mask))
+            memory.put((s, a, r, s_prime, done_mask))
             s = s_prime
 
             score += r
             if done:
-                train(q, None, memory, optimizer)
+                train(q, None, memory, optimizer, n_epi)
 
                 # params = (
                 #     (q.fc1, "weight"),
