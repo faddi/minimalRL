@@ -16,12 +16,12 @@ writer = SummaryWriter()
 import matplotlib.pyplot as plt
 
 # Hyperparameters
-learning_rate = 1e-4
+learning_rate = 1e-2
 gamma = 0.95
 buffer_limit = 10000
-batch_size = 1
+batch_size = 64
 random_steps = 0
-num_nets = 2
+num_nets = 3
 
 
 class GaussianNoise(nn.Module):
@@ -117,7 +117,7 @@ class Qnet(nn.Module):
     def __init__(self, env: gym.Env, memory: ReplayBuffer):
         super(Qnet, self).__init__()
         self.memory = memory
-        h = 256
+        h = 32
         self.noise = GaussianNoise(sigma=0.1, is_relative_detach=False)
         # self.fc1 = nn.Linear(4, h)
         self.inp = env.observation_space.shape[0]
@@ -135,7 +135,7 @@ class Qnet(nn.Module):
         x = F.relu(self.fc2(x))
         # x = self.noise(x)
         x = self.fc3(x)  # * 500
-        # x = F.sigmoid(x) * 1 * 500  # self.memory.max_reward
+        x = F.sigmoid(x) * 1 * 500  # self.memory.max_reward
         return x
 
     def sample_action(self, obs, epsilon, mem_size):
@@ -154,11 +154,12 @@ def train_(qs, memory, optimizers, ep):
         return
 
     bz = batch_size
-    target_index = torch.randint(0, len(qs), ())
-    q = qs[target_index]
-    optimizer = optimizers[target_index]
 
     for i in range(800):
+        target_index = torch.randint(0, len(qs), ())
+        q = qs[target_index]
+        optimizer = optimizers[target_index]
+
         s, a, r, s_prime, done_mask = memory.sample(bz)
 
         q_out = q(s)
@@ -166,21 +167,23 @@ def train_(qs, memory, optimizers, ep):
         # max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
         with torch.no_grad():
 
-            # q_min = qs[0](s_prime)
-
-            # for i in range(1, len(qs)):
-            #     m = qs[i](s_prime)
-            #     q_min = torch.min(m, q_min)
-
-            q_avg = qs[0](s_prime)
+            q_min = qs[0](s_prime)
 
             for i in range(1, len(qs)):
                 m = qs[i](s_prime)
-                q_avg += m
+                q_min = torch.min(m, q_min)
 
-            q_avg = q_avg / len(qs)
+            qf = q_min
 
-            max_q_prime = q_a.max(1)[0].unsqueeze(1)
+            # q_avg = qs[0](s_prime)
+
+            # for i in range(1, len(qs)):
+            #     m = qs[i](s_prime)
+            #     q_avg += m
+
+            # q_avg = q_avg / len(qs)
+
+            max_q_prime = qf.max(1)[0].unsqueeze(1)
             target = r + gamma * max_q_prime * done_mask
 
             # target[target > 500.0] = torch.tensor(500.0)
@@ -272,16 +275,24 @@ def main():
             # outs = [q(obs).argmax().item() for q in qs]
             # a = max(set(outs), key=outs.count)
 
-            # m = qs[0](obs)
-            # for i in range(1, len(qs)):
-            #     m2 = qs[i](obs)
-            #     m = torch.max(m2, m)
+            coin = random.random()
+            if coin < epsilon:
+                a = random.randint(0, qs[0].outp - 1)
+                # return random.randint(0, 1)
+            else:
 
-            o = qs[0](obs)
-            for i in range(1, len(qs)):
-                o += qs[i](obs)
+                m = qs[0](obs)
+                for i in range(1, len(qs)):
+                    m2 = qs[i](obs)
+                    m = torch.max(m2, m)
 
-            a = o.argmax().item()
+                a = m.argmax().item()
+
+                # o = qs[0](obs)
+                # for i in range(1, len(qs)):
+                #     o += qs[i](obs)
+
+                # a = o.argmax().item()
 
             # outs = torch.stack([q(obs) for q in qs])
             # outs = torch.sum(outs, 0)
