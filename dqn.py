@@ -134,7 +134,7 @@ class Qnet(nn.Module):
         self.fc1 = nn.Linear(4, h)
         self.gumbel = Gumbel()
 
-        self.count = 2
+        self.count = 5
 
         self.picker = nn.Linear(h, self.count)
 
@@ -144,11 +144,6 @@ class Qnet(nn.Module):
                 for _ in range(self.count)
             ]
         )
-
-        # self.l1 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
-        # self.l2 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
-        # self.l3 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
-        # self.l4 = nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
 
         self.lout = nn.Linear(h * 4, 2)
 
@@ -162,21 +157,6 @@ class Qnet(nn.Module):
         lg = [ls[i] * p[:, i].unsqueeze(1) for i in range(self.count)]
 
         out = torch.stack(lg, 0).sum(0)
-
-        # l1 = self.l1(x)
-        # l2 = self.l2(x)
-        # l3 = self.l3(x)
-        # l4 = self.l4(x)
-
-        # p1 = l1 * p[:, 0].unsqueeze(1)
-        # p2 = l2 * p[:, 1].unsqueeze(1)
-        # p3 = l3 * p[:, 2].unsqueeze(1)
-        # p4 = l4 * p[:, 3].unsqueeze(1)
-
-        # q = torch.cat([p1, p2, p3, p4], 1)
-        # out = self.lout(q)
-
-        # out = p1 + p2 + p3 + p4
 
         return {"out": out, "p": p, "p_soft": p_soft}
         # return l1
