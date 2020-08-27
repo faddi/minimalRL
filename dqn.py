@@ -109,7 +109,8 @@ class Gumbel(nn.Module):
 
     def forward(self, x, gumbel_temp=1.0, gumbel_noise=True):
         if not self.training:  # no Gumbel noise during inference
-            return (x >= 0).float()
+            r = (x >= 0).float()
+            return r, r
 
         if gumbel_noise:
             eps = self.eps
@@ -126,52 +127,53 @@ class Gumbel(nn.Module):
         return hard, soft
 
 
+class GLinear(nn.Module):
+    def __init__(self, in_features, out_features):
+        super(GLinear, self).__init__()
+        self.gumbel = Gumbel()
+        self.picker = nn.Linear(in_features, out_features)
+        self.layer = nn.Linear(in_features, out_features)
+
+    def forward(self, x, skip_gumbel=False):
+        xl = self.layer(x)
+
+        if skip_gumbel:
+            out = xl
+            p, p_soft = None, None
+        else:
+            p, p_soft = self.gumbel(self.picker(x))
+            out = xl * p
+
+        return {"out": out, "p": p, "p_soft": p_soft}
+
+
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        h = 4
+        h = 32
         self.noise = GaussianNoise(sigma=0.05)
-        self.fc1 = nn.Linear(4, h)
-        self.gumbel = Gumbel()
+        self.fc1 = GLinear(4, h)
+        self.fc2 = GLinear(h, h)
+        self.fc3 = nn.Linear(h, 2)
+        self.do = nn.Dropout()
 
-        self.count = 5
+    def forward(self, x, skip_gumbel=False):
+        o1 = self.fc1(x, skip_gumbel)
+        o2 = self.fc2(self.do(torch.tanh(o1["out"])), skip_gumbel)
+        o3 = self.fc3(self.do(torch.tanh(o2["out"])))
 
-        self.picker = nn.Linear(h, self.count)
+        p = [o1["p"], o2["p"]]
+        p_soft = [o1["p_soft"], o2["p_soft"]]
 
-        self.l = nn.ModuleList(
-            [
-                nn.Sequential(nn.Linear(h, h), nn.ReLU(), nn.Linear(h, 2))
-                for _ in range(self.count)
-            ]
-        )
+        return {"out": o3, "p": p, "p_soft": p_soft}
 
-        self.lout = nn.Linear(h * 4, 2)
-
-    def forward(self, x):
-        x = torch.tanh(self.fc1(x))
-
-        p, p_soft = self.gumbel(self.picker(x))
-
-        ls = [l(x) for l in self.l]
-
-        lg = [ls[i] * p[:, i].unsqueeze(1) for i in range(self.count)]
-
-        out = torch.stack(lg, 0).sum(0)
-
-        return {"out": out, "p": p, "p_soft": p_soft}
-        # return l1
-
-        # w = self.fg(x)
-
-        # return tot * (w) + tot_gated * (1.0 - w)
-
-    def sample_action(self, obs, epsilon, mem_size):
+    def sample_action(self, obs, epsilon, mem_size, skip_gumbel=False):
         coin = random.random()
         if coin < epsilon or mem_size < random_steps:
             # return random.randint(0, 3)
             return random.randint(0, 1)
         else:
-            out = self.forward(obs.unsqueeze(0))
+            out = self.forward(obs.unsqueeze(0), skip_gumbel)
             return out["out"].argmax().item()
 
 
@@ -179,7 +181,12 @@ class Qnet(nn.Module):
 # beta.cdf()
 
 
-def train(q, q_target, memory, optimizer, epoch):
+def train(q, q_target, memory, optimizer, epoch, skip_gumbel=False):
+
+    qt = q
+    # qt = Qnet()
+    # qt.load_state_dict(q.state_dict())
+    # qt.eval()
 
     losses = []
     if memory.size() < random_steps:
@@ -195,25 +202,36 @@ def train(q, q_target, memory, optimizer, epoch):
         # s = s + n
         # s_prime = s_prime + n
 
-        q_out = q(s)
+        q_out = q(s, skip_gumbel)
         d = q_out["p_soft"]
         # d = q_out["p"]
         q_a = q_out["out"].gather(1, a)
         # max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
         with torch.no_grad():
-            qp = q(s_prime)
+            # qp = q(s_prime)
+            qp = qt(s_prime, skip_gumbel)
 
             max_q_prime = qp["out"].max(1)[0].unsqueeze(1)
             target = r + gamma * max_q_prime * done_mask
 
-            # target[target > 1.0] = 1.0
-        # gateLoss = F.smooth_l1_loss(d, torch.ones_like(d) / 3)
-        # gateLoss = torch.exp(-gateLoss/5)
-        # q_out["p"].sum(0) / batch_size
+        loss = F.smooth_l1_loss(q_a, target)
 
-        loss = F.smooth_l1_loss(
-            q_a, target
-        )  # + gateLoss / ( epoch + 1)  # / (torch.exp(-gateLoss))
+        ######
+
+        # q_out = q(s)
+        # q_a = q_out["out"].gather(1, a)
+        # with torch.no_grad():
+        #     qp = qt(s_prime)
+
+        #     max_q_prime = qp["out"].max(1)[0].unsqueeze(1)
+        #     target = max_q_prime * done_mask
+
+        # loss = F.smooth_l1_loss(q_a - target, r)
+        ######
+
+        # loss = F.smooth_l1_loss(
+        #     q_a, target
+        # )  # + gateLoss / ( epoch + 1)  # / (torch.exp(-gateLoss))
         # loss = F.mse_loss(q_a, target)
         # if d[0] < 0.
 
@@ -257,8 +275,19 @@ def main():
 
     print_interval = 1
     score = 0.0
-    optimizer = optim.Adam(q.parameters(), lr=learning_rate)
-    # optimizer = optim.SGD(q.parameters(), lr=learning_rate, momentum=0.95)
+    # optimizer = optim.Adam(q.parameters(), lr=learning_rate)
+    o = []
+    po = []
+
+    for name, param in q.named_parameters():
+        print(name)
+        if "picker" in name:
+            po.append(param)
+        else:
+            o.append(param)
+
+    optimizer = optim.Adam(o, lr=learning_rate)
+    picker_optimizer = optim.Adam(po, lr=learning_rate)
 
     for n_epi in range(10000):
 
@@ -275,7 +304,10 @@ def main():
         done = False
 
         while not done:
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon, memory.size())
+            use_gumbel = n_epi > 10
+            a = q.sample_action(
+                torch.from_numpy(s).float(), epsilon, memory.size(), use_gumbel
+            )
             s_prime, r, done, info = env.step(a)
             env.render()
             done_mask = 0.0 if done else 1.0
@@ -284,7 +316,12 @@ def main():
 
             score += r
             if done:
-                train(q, None, memory, optimizer, n_epi)
+                # if n_epi % 2 == 0:
+                if (n_epi / 10) % 2 == 0:
+                    # if not use_gumbel:
+                    train(q, None, memory, optimizer, n_epi, True)
+                else:
+                    train(q, None, memory, picker_optimizer, n_epi)
 
                 # params = (
                 #     (q.fc1, "weight"),
