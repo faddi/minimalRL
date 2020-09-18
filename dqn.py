@@ -1,6 +1,7 @@
 import gym
 import collections
 import random
+from gym.logger import error
 
 import torch
 import torch.nn as nn
@@ -9,7 +10,7 @@ import torch.optim as optim
 import numpy as np
 
 # Hyperparameters
-learning_rate = 0.001
+learning_rate = 0.01
 gamma = 0.98
 buffer_limit = 50000
 batch_size = 128
@@ -46,11 +47,20 @@ class ReplayBuffer:
         return len(self.buffer)
 
 
-def dtanh(x):
-    ex = torch.exp(x)
-    mex = torch.exp(-x)
+def dnl(x):
+    # ex = torch.exp(x)
+    # mex = torch.exp(-x)
 
-    return 1 - ((ex - mex) ** 2 / (ex + mex) ** 2)
+    # return 1 - ((ex - mex) ** 2 / (ex + mex) ** 2)
+
+    return 1 - (torch.tanh(x) ** 2)
+
+    # return torch.tanh(x) ** 2
+
+
+def nl(x):
+    return torch.tanh(x)
+    # return x - torch.tanh(x)
 
 
 class Lin(nn.Module):
@@ -59,34 +69,39 @@ class Lin(nn.Module):
         self.layer = nn.Linear(in_features, out_features, bias=True)
         # self.B = (torch.rand(2, out_features) - 0.5) / 2
 
-        self.B = torch.randn(2, out_features) / 2
+        self.B = torch.randn(1, out_features)
+        self.B = (self.B - self.B.mean()) / self.B.std()
+        # torch.nn.init.xavier_normal_(self.B)
         self.layer.weight.zero_()
-        self.layer.bias.zero_()
+        torch.nn.init.constant_(self.layer.bias, 1)
         self.last = last
         # self.Bb = torch.randn(1, out_features)
 
     def get_grad(self, errors):
 
+        # errors.clamp_(-1.1, 1.1)
+        errors = (errors - errors.mean()) / errors.std()
+
         if not self.last:
-            Berr = errors.mm(self.B)
-            # Bout = Berr * dtanh(self.out)
-            Bout = Berr * torch.cos(self.out)
-            a = torch.transpose(Bout, 0, 1).mm(self.input)
-            b = torch.cos(self.out)
+            Berr = errors.matmul(self.B)
+            Bout = Berr * dnl(nl(self.out))
+            a = torch.transpose(Bout, 0, 1).matmul(self.input)
+            b = nl(self.out)
 
         else:
             # last: (e) * (input)T
             # ee = torch.cat([errors, torch.zeros(8, 1)], 1)
-            a = torch.transpose(errors, 0, 1).mm(self.input)
+            a = torch.transpose(errors, 0, 1).matmul(self.input)
             b = errors
 
-        return -a, -b
+        return -a, b
 
     def update_grad(self, errors):
         g, b = self.get_grad(errors)
-        # self.layer.weight.grad = g
         self.layer.weight.grad = g
-        self.layer.bias.grad = b.mean(-2)
+        # self.layer.weight += g
+        # self.layer.weight.data -= learning_rate * g
+        # self.layer.bias.grad = b.sum(0)
         return 0
 
         # if self.layer.bias is not None:
@@ -111,14 +126,14 @@ class Qnet(nn.Module):
         for _ in range(2):
             self.layers.append(Lin(h, h))
 
-        self.out = Lin(h, 2, last=True)
+        self.out = Lin(h, 2, last=False)
 
     def forward(self, x):
 
         for l in self.layers:
-            x = torch.sin(l(x))
+            x = nl(l(x))
 
-        out = torch.sigmoid(self.out(x)) * 500
+        out = self.out(x)
 
         return out
 
@@ -133,7 +148,7 @@ class Qnet(nn.Module):
 
 def train(q, q_target, memory, optimizer):
     losses = []
-    for i in range(10):
+    for i in range(100):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
         # q_out = q(s)
@@ -144,15 +159,23 @@ def train(q, q_target, memory, optimizer):
 
         q_out = q(s)
         q_a = q_out.gather(1, a)
-        max_vals, max_indexes = q_target(s_prime).max(1)
+        max_vals, max_indexes = q(s_prime).max(1)
 
         max_q_prime = max_vals.unsqueeze(1)
 
-        target = r + gamma * max_q_prime * done_mask
-        loss = F.smooth_l1_loss(q_a, target, reduce=False)
+        # target = r + gamma * max_q_prime * done_mask
+        # loss = F.smooth_l1_loss(q_a, target, reduce=False)
+        target = gamma * max_q_prime * done_mask
+        loss = F.smooth_l1_loss(r, target - q_a, reduce=False)
 
-        a = torch.zeros_like(q_out)
-        a[:, max_indexes] = loss
+        a = loss
+
+        # a = torch.zeros_like(q_out)
+        # # a[:, max_indexes] = loss
+
+        # for i, l in enumerate(loss):
+        #     a[i][max_indexes[i]] = l
+
         # e = torch.cat([errors, torch.zeros(8, 1)], 1)
 
         losses.append(loss.mean())
@@ -174,13 +197,17 @@ def main():
     q = Qnet()
     q_target = Qnet()
     q_target.load_state_dict(q.state_dict())
+    for i in range(len(q.layers)):
+        q_target.layers[i].B = q.layers[i].B
+
+    q_target.out.B = q.out.B
     memory = ReplayBuffer()
     print(q)
 
     print_interval = 1
     score = 0.0
     # optimizer = optim.Adam(q.parameters(), lr=learning_rate)
-    optimizer = optim.SGD(q.parameters(), lr=learning_rate)
+    optimizer = optim.SGD(q.parameters(), lr=learning_rate, weight_decay=0.001)
 
     for n_epi in range(10000):
         epsilon = max(
@@ -203,8 +230,15 @@ def main():
         if memory.size() > 2000:
             train(q, q_target, memory, optimizer)
 
-        if n_epi % print_interval == 0 and n_epi != 0:
+        if n_epi % 10 == 0:
             q_target.load_state_dict(q.state_dict())
+
+            for i in range(len(q.layers)):
+                q_target.layers[i].B = q.layers[i].B
+
+            q_target.out.B = q.out.B
+
+        if n_epi % print_interval == 0 and n_epi != 0:
             print(
                 "n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%".format(
                     n_epi, score / print_interval, memory.size(), epsilon * 100
