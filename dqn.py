@@ -70,7 +70,7 @@ class Lin(nn.Module):
         # self.B = (torch.rand(2, out_features) - 0.5) / 2
 
         self.B = torch.randn(1, out_features)
-        self.B = (self.B - self.B.mean()) / self.B.std()
+        # self.B = (self.B - self.B.mean()) / self.B.std()
         # torch.nn.init.xavier_normal_(self.B)
         self.layer.weight.zero_()
         torch.nn.init.constant_(self.layer.bias, 1)
@@ -83,10 +83,15 @@ class Lin(nn.Module):
         errors = (errors - errors.mean()) / errors.std()
 
         if not self.last:
+
             Berr = errors.matmul(self.B)
-            Bout = Berr * dnl(nl(self.out))
-            a = torch.transpose(Bout, 0, 1).matmul(self.input)
+            a = torch.transpose(Berr, 0, 1).matmul(self.input)
             b = nl(self.out)
+
+            # Berr = errors.matmul(self.B)
+            # Bout = Berr * dnl(nl(self.out))
+            # a = torch.transpose(Bout, 0, 1).matmul(self.input)
+            # b = nl(self.out)
 
         else:
             # last: (e) * (input)T
@@ -94,7 +99,7 @@ class Lin(nn.Module):
             a = torch.transpose(errors, 0, 1).matmul(self.input)
             b = errors
 
-        return -a, b
+        return a, b
 
     def update_grad(self, errors):
         g, b = self.get_grad(errors)
@@ -118,12 +123,12 @@ class Lin(nn.Module):
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        h = 128
+        h = 16
 
         self.layers = nn.ModuleList()
         self.layers.append(Lin(4, h))
 
-        for _ in range(2):
+        for _ in range(10):
             self.layers.append(Lin(h, h))
 
         self.out = Lin(h, 2, last=False)
@@ -207,7 +212,7 @@ def main():
     print_interval = 1
     score = 0.0
     # optimizer = optim.Adam(q.parameters(), lr=learning_rate)
-    optimizer = optim.SGD(q.parameters(), lr=learning_rate, weight_decay=0.001)
+    optimizer = optim.SGD(q.parameters(), lr=learning_rate, weight_decay=0.1)
 
     for n_epi in range(10000):
         epsilon = max(
@@ -220,7 +225,7 @@ def main():
             a = q.sample_action(torch.from_numpy(s).float(), epsilon)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
-            memory.put((s, a, r, s_prime, done_mask))
+            memory.put((s, a, r / 100, s_prime, done_mask))
             s = s_prime
 
             score += r
