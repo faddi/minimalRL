@@ -10,7 +10,7 @@ import torch.optim as optim
 import numpy as np
 
 # Hyperparameters
-learning_rate = 0.01
+learning_rate = 0.1
 gamma = 0.98
 buffer_limit = 50000
 batch_size = 128
@@ -69,7 +69,7 @@ class Lin(nn.Module):
         self.layer = nn.Linear(in_features, out_features, bias=True)
         # self.B = (torch.rand(2, out_features) - 0.5) / 2
 
-        self.B = torch.randn(1, out_features)
+        self.B = torch.randn(2, out_features)
         # self.B = (self.B - self.B.mean()) / self.B.std()
         # torch.nn.init.xavier_normal_(self.B)
         self.layer.weight.zero_()
@@ -82,28 +82,39 @@ class Lin(nn.Module):
         # errors.clamp_(-1.1, 1.1)
         errors = (errors - errors.mean()) / errors.std()
 
+        Berr = errors.matmul(self.B)
         if not self.last:
-
-            Berr = errors.matmul(self.B)
-            a = torch.transpose(Berr, 0, 1).matmul(self.input)
-            b = nl(self.out)
-
-            # Berr = errors.matmul(self.B)
-            # Bout = Berr * dnl(nl(self.out))
-            # a = torch.transpose(Bout, 0, 1).matmul(self.input)
-            # b = nl(self.out)
-
+            BerrOut = Berr * dnl(nl(self.out))
         else:
-            # last: (e) * (input)T
-            # ee = torch.cat([errors, torch.zeros(8, 1)], 1)
-            a = torch.transpose(errors, 0, 1).matmul(self.input)
-            b = errors
+            BerrOut = Berr
+        a = torch.transpose(BerrOut, 0, 1).matmul(self.input)
+
+        b = BerrOut.sum(0)
+
+        # if not self.last:
+
+        #     Berr = errors.matmul(self.B)
+        #     Berr = Berr * dnl(nl(self.out))
+        #     a = torch.transpose(Berr, 0, 1).matmul(self.input)
+        #     b = dnl(nl(self.out))
+
+        #     # Berr = errors.matmul(self.B)
+        #     # Bout = Berr * dnl(nl(self.out))
+        #     # a = torch.transpose(Bout, 0, 1).matmul(self.input)
+        #     # b = nl(self.out)
+
+        # else:
+        #     # last: (e) * (input)T
+        #     # ee = torch.cat([errors, torch.zeros(8, 1)], 1)
+        #     a = torch.transpose(errors, 0, 1).matmul(self.input)
+        #     b = errors
 
         return a, b
 
     def update_grad(self, errors):
         g, b = self.get_grad(errors)
-        self.layer.weight.grad = g
+        self.layer.weight -= g
+        self.layer.bias -= b
         # self.layer.weight += g
         # self.layer.weight.data -= learning_rate * g
         # self.layer.bias.grad = b.sum(0)
@@ -128,10 +139,10 @@ class Qnet(nn.Module):
         self.layers = nn.ModuleList()
         self.layers.append(Lin(4, h))
 
-        for _ in range(10):
+        for _ in range(2):
             self.layers.append(Lin(h, h))
 
-        self.out = Lin(h, 2, last=False)
+        self.out = Lin(h, 2, last=True)
 
     def forward(self, x):
 
@@ -139,6 +150,8 @@ class Qnet(nn.Module):
             x = nl(l(x))
 
         out = self.out(x)
+
+        # out.clamp_(0, 500)
 
         return out
 
@@ -164,7 +177,7 @@ def train(q, q_target, memory, optimizer):
 
         q_out = q(s)
         q_a = q_out.gather(1, a)
-        max_vals, max_indexes = q(s_prime).max(1)
+        max_vals, max_indexes = q_target(s_prime).max(1)
 
         max_q_prime = max_vals.unsqueeze(1)
 
@@ -173,13 +186,13 @@ def train(q, q_target, memory, optimizer):
         target = gamma * max_q_prime * done_mask
         loss = F.smooth_l1_loss(r, target - q_a, reduce=False)
 
-        a = loss
+        # a = loss
 
-        # a = torch.zeros_like(q_out)
+        a = torch.zeros_like(q_out)
         # # a[:, max_indexes] = loss
 
-        # for i, l in enumerate(loss):
-        #     a[i][max_indexes[i]] = l
+        for i, l in enumerate(loss):
+            a[i][max_indexes[i]] = l
 
         # e = torch.cat([errors, torch.zeros(8, 1)], 1)
 
@@ -212,7 +225,9 @@ def main():
     print_interval = 1
     score = 0.0
     # optimizer = optim.Adam(q.parameters(), lr=learning_rate)
-    optimizer = optim.SGD(q.parameters(), lr=learning_rate, weight_decay=0.1)
+    optimizer = optim.SGD(
+        q.parameters(), lr=learning_rate, weight_decay=0.0, momentum=0.95
+    )
 
     for n_epi in range(10000):
         epsilon = max(
@@ -225,7 +240,7 @@ def main():
             a = q.sample_action(torch.from_numpy(s).float(), epsilon)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
-            memory.put((s, a, r / 100, s_prime, done_mask))
+            memory.put((s, a, r / 500, s_prime, done_mask))
             s = s_prime
 
             score += r
