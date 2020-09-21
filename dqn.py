@@ -8,7 +8,7 @@ import torch.nn.functional as F
 import torch.optim as optim
 
 # Hyperparameters
-learning_rate = 0.0005
+learning_rate = 0.01
 gamma = 0.98
 buffer_limit = 50000
 batch_size = 32
@@ -46,11 +46,15 @@ class ReplayBuffer:
 
 
 class Lin(nn.Module):
-    def __init__(self, in_features, out_features, loss_out_features, memory):
+    def __init__(self, in_features, out_features, loss_out_features):
         super(Lin, self).__init__()
         self.layer = nn.Linear(in_features, out_features)
         self.encoding = nn.Linear(out_features, loss_out_features)
-        self.memory = memory
+        self.optimizer = optim.Adam(self.parameters(), lr=learning_rate)
+
+    def train_layer(self, q, target, memory, layer_trained):
+        if self.training:
+            train(q, target, memory, self.optimizer, layer_trained)
 
     def forward(self, x):
         x = F.relu(self.layer(x))
@@ -61,18 +65,25 @@ class Lin(nn.Module):
 class Qnet(nn.Module):
     def __init__(self, memory):
         super(Qnet, self).__init__()
-        self.fc1 = Lin(4, 128, 2, memory)
-        self.fc2 = Lin(128, 128, 2, memory)
-        self.fc3 = nn.Linear(128, 2)
+        self.fc1 = Lin(4, 128, 2)
+        self.fc2 = Lin(128, 128, 2)
+        self.fc3 = Lin(128, 2, 2)
+        self.memory = memory
 
-    def forward(self, x):
+    def forward(self, x, target, train=True):
         x, e1 = self.fc1(x)
+        if train:
+            self.fc1.train_layer(self, target, self.memory, 0)
         x, e2 = self.fc2(x)
-        x = self.fc3(x)
-        return x, e1, e2
+        if train:
+            self.fc2.train_layer(self, target, self.memory, 1)
+        x, e3 = self.fc3(x)
+        if train:
+            self.fc3.train_layer(self, target, self.memory, 2)
+        return x, e1, e2, e3
 
-    def sample_action(self, obs, epsilon):
-        out = self.forward(obs)
+    def sample_action(self, obs, epsilon, target):
+        out = self.forward(obs, target)
         coin = random.random()
         if coin < epsilon:
             return random.randint(0, 1)
@@ -80,21 +91,29 @@ class Qnet(nn.Module):
             return out[0].argmax().item()
 
 
-def train(q, q_target, memory, optimizer):
-    for i in range(10):
+def train(q, q_target, memory, optimizer, layer_trained):
+
+    if memory.size() < batch_size:
+        return
+
+    for i in range(1):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
-        q_out, e1, e2 = q(s)
-        q_a = q_out.gather(1, a)
-        q_e1 = e1.gather(1, a)
-        q_e2 = e2.gather(1, a)
-        max_q_prime = q_target(s_prime)[0].max(1)[0].unsqueeze(1)
-        target = r + gamma * max_q_prime * done_mask
-        lossq = F.smooth_l1_loss(q_a, target)
-        loss1 = F.smooth_l1_loss(q_e1, target)
-        loss2 = F.smooth_l1_loss(q_e2, target)
+        e3, e0, e1, e2 = q(s, q_target, False)
+        if layer_trained == 0:
+            q_out = e0
+        elif layer_trained == 1:
+            q_out = e1
+        elif layer_trained == 2:
+            q_out = e2
+        else:
+            q_out = e3
 
-        loss = loss1 + loss2 + lossq
+        q_a = q_out.gather(1, a)
+        with torch.no_grad():
+            max_q_prime = q_target(s_prime, q_target, False)[0].max(1)[0].unsqueeze(1)
+            target = r + gamma * max_q_prime * done_mask
+        loss = F.smooth_l1_loss(q_a, target)
 
         optimizer.zero_grad()
         loss.backward()
@@ -106,11 +125,11 @@ def main():
     memory = ReplayBuffer()
     q = Qnet(memory)
     q_target = Qnet(memory)
+    q_target.eval()
     q_target.load_state_dict(q.state_dict())
 
-    print_interval = 20
+    print_interval = 1
     score = 0.0
-    optimizer = optim.Adam(q.parameters(), lr=learning_rate)
 
     for n_epi in range(10000):
         epsilon = max(
@@ -120,7 +139,7 @@ def main():
         done = False
 
         while not done:
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon)
+            a = q.sample_action(torch.from_numpy(s).float(), epsilon, q_target)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r / 100.0, s_prime, done_mask))
@@ -130,8 +149,8 @@ def main():
             if done:
                 break
 
-        if memory.size() > 2000:
-            train(q, q_target, memory, optimizer)
+        # if memory.size() > 2000:
+        #     train(q, q_target, memory, optimizer)
 
         if n_epi % print_interval == 0 and n_epi != 0:
             q_target.load_state_dict(q.state_dict())
