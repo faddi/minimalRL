@@ -59,18 +59,29 @@ class ReplayBuffer:
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        self.fc1 = nn.Linear(4, 128)
-        self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, 2)
+        h = 32
+        self.hidden = h
+        self.fc1 = nn.Linear(4, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, 2)
 
     def forward(self, x):
-        x = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(x))
+        h1 = F.relu(self.fc1(x))
+        x = F.relu(self.fc2(h1))
+        x = self.fc3(x)
+        return {"hidden": h1, "output": x}
+
+    def get_hidden(self, x):
+        h1 = F.relu(self.fc1(x))
+        return h1
+
+    def from_hidden(self, s):
+        x = F.relu(self.fc2(s))
         x = self.fc3(x)
         return x
 
     def sample_action(self, obs, epsilon):
-        out = self.forward(obs)
+        out = self.forward(obs)["output"]
         coin = random.random()
         if coin < epsilon:
             return random.randint(0, 1)
@@ -78,22 +89,77 @@ class Qnet(nn.Module):
             return out.argmax().item()
 
 
-def train(q, q_target, memory, optimizer):
-    for i in range(10):
-        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+class Model(nn.Module):
+    def __init__(self, input_size, action_size, reward_size=1):
+        super(Model, self).__init__()
+        self.input_size = input_size
+        h = 32
+        self.embed_state = nn.Linear(input_size, h)
+        self.embed_action = nn.Linear(action_size, h)
+        self.fc2 = nn.Linear(h, h)
+        self.fc3 = nn.Linear(h, input_size)
+        self.fc4 = nn.Linear(h, reward_size)
 
-        q_out = q(s)
-        q_a = q_out.gather(1, a)
+    def forward(self, state, action):
+        state_embedding = F.relu(self.embed_state(state))
+        action_embedding = F.relu(self.embed_action(action))
+
+        x = state_embedding * action_embedding
+
+        x = F.relu(self.fc2(x))
+        next = self.fc3(x)
+        reward = self.fc4(x)
+        return {"next_hidden": next, "reward": reward}
+
+
+def train(q, q_target, model, memory, optimizer):
+    for i in range(1):
+        s, a, r_raw, s_prime_raw, done_mask = memory.sample(batch_size)
 
         with torch.no_grad():
-            max_q_prime = q_target(s_prime).max(1)[0].unsqueeze(1)
+            h = q.get_hidden(s)
+            out = model(h, a.float())
+
+            s_prime = out["next_hidden"]
+            r = out["reward"]
+            max_q_prime = q_target.from_hidden(s_prime).max(1)[0].unsqueeze(1)
             target = r + gamma * max_q_prime * done_mask
+
+        q_out = q(s)["output"]
+        q_a = q_out.gather(1, a)
 
         loss = F.smooth_l1_loss(q_a, target)
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+
+def train_model(model, q, memory, optimizer):
+
+    losses = []
+
+    for i in range(10):
+        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+
+        with torch.no_grad():
+            hidden = q.get_hidden(s)
+            target_hidden = q.get_hidden(s_prime)
+
+        o = model(hidden, a.float())
+
+        state_loss = F.smooth_l1_loss(o["next_hidden"], target_hidden)
+        reward_loss = F.smooth_l1_loss(o["reward"], r)
+
+        loss = state_loss + reward_loss
+
+        losses.append(loss.item())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return np.mean(losses)
 
 
 def main():
@@ -103,11 +169,14 @@ def main():
     q_target = Qnet()
     q_target.load_state_dict(q.state_dict())
     q_target.eval()
+
+    model = Model(input_size=q.hidden, action_size=1)
     memory = ReplayBuffer()
 
-    print_interval = 20
+    print_interval = 1
     score = 0.0
-    optimizer = optim.Adam(q.parameters(), lr=learning_rate)
+    optimizer_q = optim.Adam(q.parameters(), lr=learning_rate)
+    optimizer_model = optim.Adam(model.parameters(), lr=learning_rate)
 
     for n_epi in range(10000):
         epsilon = max(
@@ -123,15 +192,17 @@ def main():
             memory.put((s, a, r / 100.0, s_prime, done_mask))
             s = s_prime
 
+            if memory.size() > batch_size:
+                train_model(model, q, memory, optimizer_model)
+                train(q, q_target, model, memory, optimizer_q)
+
             score += r
             if done:
                 break
 
-        if memory.size() > 2000:
-            train(q, q_target, memory, optimizer)
+        q_target.load_state_dict(q.state_dict())
 
         if n_epi % print_interval == 0 and n_epi != 0:
-            q_target.load_state_dict(q.state_dict())
             print(
                 "n_episode :{}, score : {:.1f}, n_buffer : {}, eps : {:.1f}%".format(
                     n_epi, score / print_interval, memory.size(), epsilon * 100
