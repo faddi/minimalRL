@@ -5,6 +5,7 @@ import random
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.nn.modules.activation import ReLU
 import torch.optim as optim
 
 import numpy as np
@@ -14,6 +15,10 @@ learning_rate = 0.0005
 gamma = 0.98
 buffer_limit = 50000
 batch_size = 32
+
+env_name = "CartPole-v1"
+action_size = 2
+state_size = 4
 
 
 def seed_everything(env, seed: int = 10):
@@ -59,32 +64,30 @@ class ReplayBuffer:
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        h = 32
+        h = 64
         self.hidden = h
-        self.fc1 = nn.Linear(4, h)
-        self.fc2 = nn.Linear(h, h)
-        self.fc3 = nn.Linear(h, 2)
+        self.state_embedding = nn.Sequential(nn.Linear(state_size, h), nn.ReLU())
+
+        self.output = nn.Sequential(
+            nn.Linear(h, h), nn.ReLU(), nn.Linear(h, action_size)
+        )
 
     def forward(self, x):
-        h1 = F.relu(self.fc1(x))
-        x = F.relu(self.fc2(h1))
-        x = self.fc3(x)
+        h1 = self.get_hidden(x)
+        x = self.output(h1)
         return {"hidden": h1, "output": x}
 
     def get_hidden(self, x):
-        h1 = F.relu(self.fc1(x))
-        return h1
+        return self.state_embedding(x)
 
     def from_hidden(self, s):
-        x = F.relu(self.fc2(s))
-        x = self.fc3(x)
-        return x
+        return self.output(s)
 
     def sample_action(self, obs, epsilon):
         out = self.forward(obs)["output"]
         coin = random.random()
         if coin < epsilon:
-            return random.randint(0, 1)
+            return random.randint(0, action_size - 1)
         else:
             return out.argmax().item()
 
@@ -93,7 +96,7 @@ class Model(nn.Module):
     def __init__(self, input_size, action_size, reward_size=1):
         super(Model, self).__init__()
         self.input_size = input_size
-        h = 32
+        h = 64
         self.embed_state = nn.Linear(input_size, h)
         self.embed_action = nn.Linear(action_size, h)
         self.fc2 = nn.Linear(h, h)
@@ -112,9 +115,34 @@ class Model(nn.Module):
         return {"next_hidden": next, "reward": reward}
 
 
+def train_embedding(q, q_target, memory, optimizer):
+    losses = []
+    for i in range(10):
+        s, a, r, s_prime, done_mask = memory.sample(batch_size)
+
+        with torch.no_grad():
+            max_q_prime = q_target(s_prime)["output"].max(1)[0].unsqueeze(1)
+            target = r + gamma * max_q_prime * done_mask
+
+        q_out = q(s)["output"]
+        q_a = q_out.gather(1, a)
+
+        loss = F.smooth_l1_loss(q_a, target)
+        losses.append(loss.item())
+
+        optimizer.zero_grad()
+        loss.backward()
+        optimizer.step()
+
+    return np.mean(losses)
+
+
 def train(q, q_target, model, memory, optimizer):
-    for i in range(1):
-        s, a, r_raw, s_prime_raw, done_mask = memory.sample(batch_size)
+    losses = []
+    for i in range(10):
+        s, a_raw, r_raw, s_prime_raw, done_mask = memory.sample(batch_size)
+
+        a = torch.randint(action_size, a_raw.shape).long()
 
         with torch.no_grad():
             h = q.get_hidden(s)
@@ -126,30 +154,33 @@ def train(q, q_target, model, memory, optimizer):
             target = r + gamma * max_q_prime * done_mask
 
         q_out = q(s)["output"]
-        q_a = q_out.gather(1, a)
+        q_a = q_out.gather(1, a.long())
 
         loss = F.smooth_l1_loss(q_a, target)
+        losses.append(loss.item())
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+    return np.mean(losses)
 
 
 def train_model(model, q, memory, optimizer):
 
     losses = []
 
-    for i in range(10):
+    for i in range(1):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
         with torch.no_grad():
             hidden = q.get_hidden(s)
             target_hidden = q.get_hidden(s_prime)
 
-        o = model(hidden, a.float())
+        o = model(hidden.float(), a.float())
 
         state_loss = F.smooth_l1_loss(o["next_hidden"], target_hidden)
-        reward_loss = F.smooth_l1_loss(o["reward"], r)
+        reward_loss = F.smooth_l1_loss(o["reward"], r.float())
 
         loss = state_loss + reward_loss
 
@@ -163,7 +194,9 @@ def train_model(model, q, memory, optimizer):
 
 
 def main():
-    env = gym.make("CartPole-v1")
+    # env = gym.make("CartPole-v1")
+    # env = gym.make("LunarLander-v2")
+    env = gym.make(env_name)
     seed_everything(env, 11)
     q = Qnet()
     q_target = Qnet()
@@ -175,17 +208,21 @@ def main():
 
     print_interval = 1
     score = 0.0
-    optimizer_q = optim.Adam(q.parameters(), lr=learning_rate)
+    optimizer_q_output = optim.Adam(q.output.parameters(), lr=learning_rate)
+    optimizer_q_state = optim.Adam(q.state_embedding.parameters(), lr=learning_rate)
     optimizer_model = optim.Adam(model.parameters(), lr=learning_rate)
 
     for n_epi in range(10000):
         epsilon = max(
-            0.01, 0.08 - 0.01 * (n_epi / 200)
+            0.01, 0.01 - 0.01 * (n_epi / 200)
         )  # Linear annealing from 8% to 1%
         s = env.reset()
         done = False
 
+        step = 0
         while not done:
+            step += 1
+            env.render()
             a = q.sample_action(torch.from_numpy(s).float(), epsilon)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
@@ -193,8 +230,13 @@ def main():
             s = s_prime
 
             if memory.size() > batch_size:
-                train_model(model, q, memory, optimizer_model)
-                train(q, q_target, model, memory, optimizer_q)
+                l0 = train_embedding(q, q_target, memory, optimizer_q_state)
+                # l0 = 0
+                l1 = train_model(model, q, memory, optimizer_model)
+                l2 = train(q, q_target, model, memory, optimizer_q_output)
+
+                # if step % 10 == 0:
+                #     print(f"model: {l1}, q_out: {l2}, q_embed: {l0}")
 
             score += r
             if done:
