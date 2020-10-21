@@ -14,9 +14,10 @@ import numpy as np
 learning_rate = 0.0005
 gamma = 0.98
 buffer_limit = 50000
-batch_size = 32
+batch_size = 32 * 4
 
 env_name = "CartPole-v1"
+# env_name = "LunarLander-v2"
 action_size = 2
 state_size = 4
 
@@ -52,7 +53,7 @@ class ReplayBuffer:
         return (
             torch.tensor(s_lst, dtype=torch.float),
             torch.tensor(a_lst),
-            torch.tensor(r_lst),
+            torch.tensor(r_lst, dtype=torch.float),
             torch.tensor(s_prime_lst, dtype=torch.float),
             torch.tensor(done_mask_lst),
         )
@@ -66,11 +67,11 @@ class Qnet(nn.Module):
         super(Qnet, self).__init__()
         h = 64
         self.hidden = h
-        self.state_embedding = nn.Sequential(nn.Linear(state_size, h), nn.ReLU())
-
-        self.output = nn.Sequential(
-            nn.Linear(h, h), nn.ReLU(), nn.Linear(h, action_size)
+        self.state_embedding = nn.Sequential(
+            nn.Linear(state_size, h), nn.ReLU(), nn.Linear(h, h), nn.ReLU()
         )
+
+        self.output = nn.Sequential(nn.Linear(h, action_size))
 
     def forward(self, x):
         h1 = self.get_hidden(x)
@@ -117,7 +118,7 @@ class Model(nn.Module):
 
 def train_embedding(q, q_target, memory, optimizer):
     losses = []
-    for i in range(10):
+    for i in range(1):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
         with torch.no_grad():
@@ -220,6 +221,9 @@ def main():
         done = False
 
         step = 0
+        ml0 = []
+        ml1 = []
+        ml2 = []
         while not done:
             step += 1
             env.render()
@@ -234,12 +238,18 @@ def main():
                 # l0 = 0
                 l1 = train_model(model, q, memory, optimizer_model)
                 l2 = train(q, q_target, model, memory, optimizer_q_output)
+                ml0.append(l0)
+                ml1.append(l1)
+                ml2.append(l2)
 
                 # if step % 10 == 0:
                 #     print(f"model: {l1}, q_out: {l2}, q_embed: {l0}")
 
             score += r
             if done:
+                print(
+                    f"model: {np.mean(ml1)}, q_out: {np.mean(ml2)}, q_embed: {np.mean(ml0)}"
+                )
                 break
 
         q_target.load_state_dict(q.state_dict())
