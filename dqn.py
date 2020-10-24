@@ -9,6 +9,11 @@ import torch.optim as optim
 
 import numpy as np
 
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
+
+
 # Hyperparameters
 learning_rate = 0.0005
 gamma = 0.98
@@ -79,6 +84,7 @@ class Qnet(nn.Module):
 
 
 def train(q, q_target, memory, optimizer):
+    losses = []
     for i in range(10):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
 
@@ -90,10 +96,13 @@ def train(q, q_target, memory, optimizer):
             target = r + gamma * max_q_prime * done_mask
 
         loss = F.smooth_l1_loss(q_a, target)
+        losses.append(loss.item())
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
+
+    return np.mean(losses)
 
 
 def main():
@@ -108,8 +117,10 @@ def main():
     print_interval = 20
     score = 0.0
     optimizer = optim.Adam(q.parameters(), lr=learning_rate)
+    step = 0
 
     for n_epi in range(10000):
+        epi_score = 0
         epsilon = max(
             0.01, 0.08 - 0.01 * (n_epi / 200)
         )  # Linear annealing from 8% to 1%
@@ -117,18 +128,22 @@ def main():
         done = False
 
         while not done:
+            step += 1
             a = q.sample_action(torch.from_numpy(s).float(), epsilon)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r / 100.0, s_prime, done_mask))
             s = s_prime
 
-            score += r
+            epi_score += r
             if done:
+                score += epi_score
+                writer.add_scalar("Run/score", epi_score, step)
                 break
 
         if memory.size() > 2000:
-            train(q, q_target, memory, optimizer)
+            loss = train(q, q_target, memory, optimizer)
+            writer.add_scalar("Loss/q", loss, step)
 
         if n_epi % print_interval == 0 and n_epi != 0:
             q_target.load_state_dict(q.state_dict())
