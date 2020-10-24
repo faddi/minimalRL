@@ -9,12 +9,15 @@ from torch.nn.modules.activation import ReLU
 import torch.optim as optim
 
 import numpy as np
+from torch.utils.tensorboard import SummaryWriter
+
+writer = SummaryWriter()
 
 # Hyperparameters
 learning_rate = 0.0005
 gamma = 0.98
 buffer_limit = 50000
-batch_size = 32 * 4
+batch_size = 64
 
 env_name = "CartPole-v1"
 # env_name = "LunarLander-v2"
@@ -65,7 +68,7 @@ class ReplayBuffer:
 class Qnet(nn.Module):
     def __init__(self):
         super(Qnet, self).__init__()
-        h = 64
+        h = 256
         self.hidden = h
         self.state_embedding = nn.Sequential(
             nn.Linear(state_size, h), nn.ReLU(), nn.Linear(h, h), nn.ReLU()
@@ -92,12 +95,72 @@ class Qnet(nn.Module):
         else:
             return out.argmax().item()
 
+    def lookahead_action_old(self, obs, model):
+        out = self.forward(obs)
+
+        # 1 step
+        model_out = model(
+            out["hidden"].repeat(action_size, 1),
+            torch.arange(action_size).view(action_size, -1).float(),
+        )
+
+        next_hidden = model_out["next_hidden"]
+
+        next_qs = self.from_hidden(next_hidden)
+
+        o = [0, 0]
+
+        for i in range(out["output"].size(0)):
+            for j in range(next_qs.size(0)):
+                o[i] = max(o[i], out["output"][i] + next_qs[i, j])
+
+        return np.argmax(o)
+
+    def lookahead_action(self, obs, model):
+        with torch.no_grad():
+            out = self.forward(obs)
+
+            o = out["output"]
+
+            total = self.lookahead_nsteps(out["hidden"], model, 2)
+
+            for i in range(action_size):
+                o[i] += total[i]
+
+            return np.argmax(o.detach().numpy())
+
+    def lookahead_nsteps(self, hidden_state, model, step):
+        o = [0 for x in range(action_size)]
+
+        model_out = model(
+            hidden_state.repeat(action_size, 1),
+            torch.arange(action_size).view(action_size, -1).float(),
+        )
+
+        next_hidden = model_out["next_hidden"]
+
+        next_qs = self.from_hidden(next_hidden)
+
+        for i in range(action_size):  # action
+
+            if step - 1 == 0:
+                for j in range(action_size):
+                    o[i] = max(o[i], next_qs[i, j])
+            else:
+
+                # [1, 3]
+                iq = self.lookahead_nsteps(next_hidden[i], model, step - 1)
+                for j in range(action_size):
+                    o[i] = max(o[i], iq[j] + next_qs[i, j])
+
+        return o
+
 
 class Model(nn.Module):
     def __init__(self, input_size, action_size, reward_size=1):
         super(Model, self).__init__()
         self.input_size = input_size
-        h = 64
+        h = 256
         self.embed_state = nn.Linear(input_size, h)
         self.embed_action = nn.Linear(action_size, h)
         self.fc2 = nn.Linear(h, h)
@@ -110,7 +173,7 @@ class Model(nn.Module):
 
         x = state_embedding * action_embedding
 
-        x = F.relu(self.fc2(x))
+        x = self.fc2(x)
         next = self.fc3(x)
         reward = self.fc4(x)
         return {"next_hidden": next, "reward": reward}
@@ -169,7 +232,9 @@ def train(q, q_target, model, memory, optimizer):
 
 def train_model(model, q, memory, optimizer):
 
-    losses = []
+    reward_losses = []
+    state_losses = []
+    total_losses = []
 
     for i in range(1):
         s, a, r, s_prime, done_mask = memory.sample(batch_size)
@@ -185,13 +250,15 @@ def train_model(model, q, memory, optimizer):
 
         loss = state_loss + reward_loss
 
-        losses.append(loss.item())
+        state_losses.append(state_loss.item())
+        reward_losses.append(reward_loss.item())
+        total_losses.append(loss.item())
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
 
-    return np.mean(losses)
+    return np.mean(total_losses), np.mean(state_losses), np.mean(reward_losses)
 
 
 def main():
@@ -213,46 +280,50 @@ def main():
     optimizer_q_state = optim.Adam(q.state_embedding.parameters(), lr=learning_rate)
     optimizer_model = optim.Adam(model.parameters(), lr=learning_rate)
 
+    step = 0
     for n_epi in range(10000):
         epsilon = max(
             0.01, 0.01 - 0.01 * (n_epi / 200)
         )  # Linear annealing from 8% to 1%
         s = env.reset()
         done = False
-
-        step = 0
-        ml0 = []
-        ml1 = []
-        ml2 = []
         while not done:
             step += 1
             env.render()
-            a = q.sample_action(torch.from_numpy(s).float(), epsilon)
+            # a = q.sample_action(torch.from_numpy(s).float(), epsilon)
+            a = q.lookahead_action(torch.from_numpy(s).float(), model)
             s_prime, r, done, info = env.step(a)
             done_mask = 0.0 if done else 1.0
             memory.put((s, a, r / 100.0, s_prime, done_mask))
             s = s_prime
 
             if memory.size() > batch_size:
-                l0 = train_embedding(q, q_target, memory, optimizer_q_state)
+                if step % 1:
+                    l0 = train_embedding(q, q_target, memory, optimizer_q_state)
+                    writer.add_scalar("Loss/embedding", l0, step)
                 # l0 = 0
-                l1 = train_model(model, q, memory, optimizer_model)
+                l1, state_loss, reward_loss = train_model(
+                    model, q, memory, optimizer_model
+                )
                 l2 = train(q, q_target, model, memory, optimizer_q_output)
-                ml0.append(l0)
-                ml1.append(l1)
-                ml2.append(l2)
+
+                writer.add_scalar("Loss/model_total", l1, step)
+                writer.add_scalar("Loss/model_state", state_loss, step)
+                writer.add_scalar("Loss/model_reward", reward_loss, step)
+                writer.add_scalar("Loss/q", l2, step)
 
                 # if step % 10 == 0:
                 #     print(f"model: {l1}, q_out: {l2}, q_embed: {l0}")
+            if step < 1000 or step % 2000 == 0:
+                q_target.load_state_dict(q.state_dict())
 
             score += r
             if done:
-                print(
-                    f"model: {np.mean(ml1)}, q_out: {np.mean(ml2)}, q_embed: {np.mean(ml0)}"
-                )
+                writer.add_scalar("score", score, step)
+                # print(
+                #     f"model: {np.mean(ml1)}, q_out: {np.mean(ml2)}, q_embed: {np.mean(ml0)}"
+                # )
                 break
-
-        q_target.load_state_dict(q.state_dict())
 
         if n_epi % print_interval == 0 and n_epi != 0:
             print(
