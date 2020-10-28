@@ -122,7 +122,7 @@ class Qnet(nn.Module):
 
             o = out["output"]
 
-            total = self.lookahead_nsteps(out["hidden"], model, 2)
+            total = self.lookahead_nsteps(out["hidden"], model, 1)
 
             for i in range(action_size):
                 o[i] += total[i]
@@ -298,7 +298,7 @@ def main():
             s = s_prime
 
             if memory.size() > batch_size:
-                if step % 1:
+                if step % 1 == 0:
                     l0 = train_embedding(q, q_target, memory, optimizer_q_state)
                     writer.add_scalar("Loss/embedding", l0, step)
                 # l0 = 0
