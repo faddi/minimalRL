@@ -168,13 +168,13 @@ class Model(nn.Module):
         self.fc4 = nn.Linear(h, reward_size)
 
     def forward(self, state, action):
-        state_embedding = F.relu(self.embed_state(state))
-        action_embedding = F.relu(self.embed_action(action))
+        state_embedding = torch.tanh(self.embed_state(state))
+        action_embedding = torch.tanh(self.embed_action(action))
 
         x = state_embedding * action_embedding
 
-        x = self.fc2(x)
-        next = self.fc3(x)
+        x = torch.tanh(self.fc2(x))
+        next = self.fc3(x) + state
         reward = self.fc4(x)
         return {"next_hidden": next, "reward": reward}
 
